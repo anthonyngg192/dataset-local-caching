@@ -36,6 +36,7 @@ struct Config {
     value_size: usize,
     keyspace: u64,
     read_ratio: f64,
+    pipeline: usize, // requests sent before reading their responses (1 = closed-loop)
 }
 
 impl Default for Config {
@@ -47,6 +48,7 @@ impl Default for Config {
             value_size: 64,
             keyspace: 100_000,
             read_ratio: 0.9,
+            pipeline: 1,
         }
     }
 }
@@ -63,9 +65,10 @@ fn parse_args() -> Config {
             "--value-size" => cfg.value_size = val().parse().unwrap(),
             "--keyspace" => cfg.keyspace = val().parse().unwrap(),
             "--read-ratio" => cfg.read_ratio = val().parse().unwrap(),
+            "--pipeline" | "-p" => cfg.pipeline = val().parse::<usize>().unwrap().max(1),
             "-h" | "--help" => {
                 eprintln!(
-                    "bench --addr <host:port> --connections N --requests N \\\n      --value-size BYTES --keyspace N --read-ratio 0.0..1.0"
+                    "bench --addr <host:port> --connections N --requests N \\\n      --value-size BYTES --keyspace N --read-ratio 0.0..1.0 --pipeline N"
                 );
                 std::process::exit(0);
             }
@@ -87,9 +90,9 @@ fn xorshift(state: &mut u64) -> u64 {
     x
 }
 
+/// Append one encoded request frame to `buf` (does not clear it).
 fn encode_request(buf: &mut Vec<u8>, op: u8, key: &[u8], value: &[u8]) {
     let payload_len = 1 + 2 + key.len() + value.len();
-    buf.clear();
     buf.push(HDR_REQUEST);
     buf.extend_from_slice(&(payload_len as u16).to_be_bytes());
     buf.push(op);
@@ -123,28 +126,39 @@ async fn run_connection(cfg: Config, conn_id: usize, ops: usize) -> Vec<u64> {
         .expect("handshake write failed");
 
     let value = vec![b'x'; cfg.value_size];
-    let mut buf = Vec::with_capacity(16 + cfg.value_size);
-    let mut latencies = Vec::with_capacity(ops);
+    let depth = cfg.pipeline.max(1);
+    let mut buf = Vec::with_capacity(depth * (16 + cfg.value_size));
+    let mut latencies = Vec::with_capacity(ops.div_ceil(depth));
     // Seed per-connection so connections don't all hit the same keys in lockstep.
     let mut rng = 0x9E3779B97F4A7C15u64 ^ (conn_id as u64).wrapping_mul(0xD1B54A32D192ED03);
 
     let read_threshold = (cfg.read_ratio * u64::MAX as f64) as u64;
 
-    for _ in 0..ops {
-        let key_id = xorshift(&mut rng) % cfg.keyspace;
-        let key = key_id.to_be_bytes();
-        let is_read = xorshift(&mut rng) < read_threshold;
-
-        if is_read {
-            encode_request(&mut buf, OP_GET, &key, &[]);
-        } else {
-            encode_request(&mut buf, OP_SET, &key, &value);
+    // Send `depth` requests, then read all `depth` responses. With depth == 1
+    // this is the closed-loop case; larger depths amortize the round-trip and
+    // expose the server's real ceiling. Each sample is the round-trip time of a
+    // whole batch.
+    let mut sent = 0;
+    while sent < ops {
+        let batch = depth.min(ops - sent);
+        buf.clear();
+        for _ in 0..batch {
+            let key = (xorshift(&mut rng) % cfg.keyspace).to_be_bytes();
+            if xorshift(&mut rng) < read_threshold {
+                encode_request(&mut buf, OP_GET, &key, &[]);
+            } else {
+                encode_request(&mut buf, OP_SET, &key, &value);
+            }
         }
 
         let start = Instant::now();
         stream.write_all(&buf).await.expect("write failed");
-        read_response(&mut stream).await.expect("read failed");
+        for _ in 0..batch {
+            read_response(&mut stream).await.expect("read failed");
+        }
         latencies.push(start.elapsed().as_nanos() as u64);
+
+        sent += batch;
     }
 
     latencies
@@ -169,8 +183,8 @@ async fn main() {
     let total = per_conn * cfg.connections;
 
     println!(
-        "target {} | {} connections | {} ops/conn | {} total | value {}B | read-ratio {:.2} | keyspace {}",
-        cfg.addr, cfg.connections, per_conn, total, cfg.value_size, cfg.read_ratio, cfg.keyspace
+        "target {} | {} connections | {} ops/conn | {} total | value {}B | read-ratio {:.2} | keyspace {} | pipeline {}",
+        cfg.addr, cfg.connections, per_conn, total, cfg.value_size, cfg.read_ratio, cfg.keyspace, cfg.pipeline
     );
     println!("warming up + running...");
 
@@ -190,11 +204,18 @@ async fn main() {
     all.sort_unstable();
     let throughput = total as f64 / wall.as_secs_f64();
     let mean = all.iter().sum::<u64>() as f64 / all.len().max(1) as f64;
+    // With pipelining each latency sample is a batch round-trip, not a single op.
+    let lat_unit = if cfg.pipeline > 1 {
+        format!("per-batch of {}", cfg.pipeline)
+    } else {
+        "per-op".to_string()
+    };
 
     println!("\n=== results ===");
     println!("elapsed     : {:?}", wall);
     println!("operations  : {}", total);
     println!("throughput  : {:.0} ops/sec", throughput);
+    println!("latency ({lat_unit}):");
     println!("latency mean: {}", fmt_ns(mean as u64));
     println!("latency p50 : {}", fmt_ns(percentile(&all, 50.0)));
     println!("latency p90 : {}", fmt_ns(percentile(&all, 90.0)));

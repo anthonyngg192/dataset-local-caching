@@ -85,7 +85,8 @@ cargo run --release --bin bench -- \
     --requests 500000 \
     --value-size 64 \
     --keyspace 100000 \
-    --read-ratio 0.9
+    --read-ratio 0.9 \
+    --pipeline 1
 ```
 
 ### Flags
@@ -98,28 +99,43 @@ cargo run --release --bin bench -- \
 | `--value-size` | `64` | Value size in bytes for SET. |
 | `--keyspace` | `100000` | Number of distinct keys (controls hit rate + shard spread). |
 | `--read-ratio` | `0.9` | Fraction of operations that are GET (rest are SET). |
+| `--pipeline`, `-p` | `1` | Requests sent before reading their responses. `1` = closed-loop; higher amortizes the round-trip. |
 
-### Example output
+### Closed-loop vs pipelining
+
+With `--pipeline 1` each connection sends one request and waits for its
+response before sending the next. Throughput is then bounded by the network
+round-trip (`throughput ≈ connections / latency`), **not** by the server. Raising
+the pipeline depth lets multiple requests be in flight per connection and
+exposes the server's real ceiling.
+
+Sweep at 64 connections, 2,000,000 ops, 64B values, 90% reads:
+
+| `--pipeline` | throughput | vs closed-loop | p50 latency* | p99 latency* |
+|---:|---:|---:|---:|---:|
+| 1 (closed-loop) | 139,753 ops/s | 1.0× | 0.40 ms | 1.45 ms |
+| 8 | 484,218 ops/s | 3.5× | 0.95 ms | 3.05 ms |
+| 32 | 597,667 ops/s | 4.3× | 3.32 ms | 7.48 ms |
+| 128 | 639,275 ops/s | 4.6× | 10.41 ms | 44.93 ms |
+
+\*From `--pipeline 8` upward each latency sample is a whole **batch** round-trip,
+not a single op, so the numbers are expected to grow with depth. Throughput
+plateaus around ~640k ops/s — past that, deeper pipelining only inflates latency,
+which means the bottleneck has shifted from the network to the server's
+message-passing layer.
 
 ```
-target 127.0.0.1:8383 | 64 connections | 7812 ops/conn | 499968 total | value 64B | read-ratio 0.90 | keyspace 100000
-
-=== results ===
-elapsed     : 2.487s
-operations  : 499968
-throughput  : 201019 ops/sec
-latency mean: 0.317 ms
-latency p50 : 0.289 ms
-latency p90 : 0.484 ms
-latency p99 : 0.792 ms
-latency p999: 1.453 ms
-latency max : 10.180 ms
+=== results === (--pipeline 8)
+throughput  : 484218 ops/sec
+latency (per-batch of 8):
+latency p50 : 0.952 ms
+latency p99 : 3.050 ms
 ```
 
 > **Tip:** always benchmark the `--release` build of *both* binaries. Debug
-> builds are several times slower and will give misleading numbers. Throughput
-> here is closed-loop, so it scales with `--connections` up to the point where
-> the dispatch layer saturates.
+> builds are several times slower and will give misleading numbers. Start with
+> `--pipeline 1` to see per-op latency, then raise it (8 → 32 → 128) to find the
+> throughput ceiling.
 
 ## Project layout
 
@@ -136,3 +152,8 @@ src/
 └── bin/
     └── bench.rs     # load generator
 ```
+
+---
+
+> _This documentation was written by AI, but all benchmark data comes from our
+> own system: Apple M2, 16 GB RAM, macOS._
