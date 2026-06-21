@@ -3,15 +3,13 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::{shards::worker::Worker, utils::WorkerCommand};
 
 pub struct State {
-    worker_id: usize,
     worker: Worker,
     rx: UnboundedReceiver<WorkerCommand>,
 }
 
 impl State {
-    pub fn new(worker_id: usize, rx: UnboundedReceiver<WorkerCommand>) -> Self {
+    pub fn new(rx: UnboundedReceiver<WorkerCommand>) -> Self {
         Self {
-            worker_id,
             worker: Worker::start(),
             rx,
         }
