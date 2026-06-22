@@ -4,7 +4,7 @@
 //! ```no_run
 //! # async fn run() {
 //! use dataset_client::Client;
-//! let c = Client::connect("127.0.0.1:8383", 256).await.unwrap();
+//! let c = Client::connect("127.0.0.1:8383", 256, "", "").await.unwrap();
 //! c.set(b"hello", b"world").await;
 //! let v = c.get(b"hello").await; // Some(Bytes "world"), or None on miss
 //! c.del(b"hello").await;
@@ -42,20 +42,50 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn connect(addr: &str, max_inflight: usize) -> std::io::Result<Arc<Self>> {
+    /// Connect and authenticate. Pass empty `username`/`password` when the server
+    /// has auth disabled. Errors if the server rejects the handshake.
+    pub async fn connect(
+        addr: &str,
+        max_inflight: usize,
+        username: &str,
+        password: &str,
+    ) -> std::io::Result<Arc<Self>> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true).ok();
         let (read_half, mut write_half) = stream.into_split();
 
-        // Handshake: header=1, req_id=0, len=0. No reply expected.
-        write_half.write_all(&[HANDSHAKE, 0, 0, 0, 0, 0, 0]).await?;
+        // Handshake: header=1, req_id=0, payload = [ulen:u16][user][pass].
+        let mut creds = Vec::with_capacity(2 + username.len() + password.len());
+        creds.extend_from_slice(&(username.len() as u16).to_be_bytes());
+        creds.extend_from_slice(username.as_bytes());
+        creds.extend_from_slice(password.as_bytes());
+        let mut frame = Vec::with_capacity(7 + creds.len());
+        frame.push(HANDSHAKE);
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&(creds.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&creds);
+        write_half.write_all(&frame).await?;
+
+        // Read the handshake reply (OK / ERR ...).
+        let mut reader = BufReader::new(read_half);
+        let mut head = [0u8; 7];
+        reader.read_exact(&mut head).await?;
+        let len = u16::from_be_bytes([head[5], head[6]]) as usize;
+        let mut body = vec![0u8; len];
+        reader.read_exact(&mut body).await?;
+        if body != b"OK" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                String::from_utf8_lossy(&body).into_owned(),
+            ));
+        }
 
         let slots = Arc::new(Mutex::new(Slots {
             senders: (0..max_inflight).map(|_| None).collect(),
             free: (0..max_inflight as u32).collect(),
         }));
 
-        tokio::spawn(read_loop(read_half, slots.clone()));
+        tokio::spawn(read_loop(reader, slots.clone()));
 
         Ok(Arc::new(Self {
             write: Mutex::new(write_half),
@@ -110,8 +140,7 @@ impl Client {
     }
 }
 
-async fn read_loop(read_half: OwnedReadHalf, slots: Arc<Mutex<Slots>>) {
-    let mut reader = BufReader::new(read_half);
+async fn read_loop(mut reader: BufReader<OwnedReadHalf>, slots: Arc<Mutex<Slots>>) {
     let mut head = [0u8; 7];
     loop {
         if reader.read_exact(&mut head).await.is_err() {

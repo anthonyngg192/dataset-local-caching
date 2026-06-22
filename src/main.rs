@@ -16,6 +16,9 @@ use crate::{
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
+    // Load .env if present. Real environment variables take precedence, so a
+    // `docker run -e ...` or an exported var overrides the file.
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
     // Worker count defaults to the CPU count, but can be pinned via the WORKERS
@@ -37,6 +40,12 @@ async fn main() -> anyhow::Result<()> {
     }
     info!("spawned {worker_count} workers");
 
-    let server = ServerListener::new(workers);
+    // Auth is enabled only when both env vars are set.
+    let auth = match (std::env::var("DATASET_USERNAME"), std::env::var("DATASET_PASSWORD")) {
+        (Ok(user), Ok(pass)) if !user.is_empty() && !pass.is_empty() => Some((user, pass)),
+        _ => None,
+    };
+
+    let server = ServerListener::new(workers, auth);
     server.start().await
 }

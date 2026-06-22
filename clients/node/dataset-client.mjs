@@ -21,10 +21,12 @@ const OP_DEL = 3;
 const NIL = Buffer.from('(nil)');
 
 export class DatasetClient {
-  constructor({ host = '127.0.0.1', port = 8383, maxInflight = 256 } = {}) {
+  constructor({ host = '127.0.0.1', port = 8383, maxInflight = 256, username = '', password = '' } = {}) {
     this.host = host;
     this.port = port;
     this.max = maxInflight;
+    this.username = username;
+    this.password = password;
 
     // Slot pool: req_id = slot index. A free slot guarantees a unique id and
     // doubles as backpressure (no free slot → the call waits).
@@ -35,20 +37,32 @@ export class DatasetClient {
     this.socket = null;
     this.buf = Buffer.alloc(0);
     this.closed = false;
+    this.handshake = null; // { resolve, reject } until the OK/ERR reply arrives
   }
 
+  // Resolves once the server replies OK to the handshake; rejects on auth failure
+  // or connection error.
   connect() {
     return new Promise((resolve, reject) => {
+      this.handshake = { resolve, reject };
       this.socket = net.connect(this.port, this.host, () => {
         this.socket.setNoDelay(true);
-        this._writeFrame(HANDSHAKE, 0, Buffer.alloc(0)); // no reply expected
-        resolve();
+        this._writeFrame(HANDSHAKE, 0, this._credsPayload());
       });
       this.socket.on('data', (chunk) => this._onData(chunk));
       this.socket.on('error', (e) => this._fail(e));
       this.socket.on('close', () => this._fail(new Error('connection closed')));
-      this.socket.once('error', reject); // surface connect-time errors
     });
+  }
+
+  _credsPayload() {
+    const u = Buffer.from(this.username);
+    const p = Buffer.from(this.password);
+    const buf = Buffer.allocUnsafe(2 + u.length + p.length);
+    buf.writeUInt16BE(u.length, 0);
+    u.copy(buf, 2);
+    p.copy(buf, 2 + u.length);
+    return buf;
   }
 
   close() {
@@ -129,6 +143,16 @@ export class DatasetClient {
       const id = this.buf.readUInt32BE(1);
       const payload = this.buf.subarray(7, 7 + len);
       this.buf = this.buf.subarray(7 + len);
+
+      // The very first frame is the handshake reply.
+      if (this.handshake) {
+        const hs = this.handshake;
+        this.handshake = null;
+        if (payload.toString() === 'OK') hs.resolve();
+        else hs.reject(new Error(payload.toString()));
+        continue;
+      }
+
       const slot = this.pending[id];
       if (slot) {
         this.pending[id] = null;
@@ -140,6 +164,10 @@ export class DatasetClient {
 
   _fail(err) {
     if (this.closed && err.message === 'connection closed') err = null;
+    if (this.handshake && err) {
+      this.handshake.reject(err);
+      this.handshake = null;
+    }
     for (let i = 0; i < this.pending.length; i++) {
       const slot = this.pending[i];
       if (slot) {

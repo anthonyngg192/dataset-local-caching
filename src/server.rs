@@ -34,28 +34,33 @@ impl WorkerTx {
 
 pub struct ServerListener {
     workers: Arc<Vec<WorkerTx>>,
+    /// Optional `(username, password)`. `None` = auth disabled (any handshake ok).
+    auth: Arc<Option<(String, String)>>,
 }
 
 impl ServerListener {
-    pub fn new(workers: Vec<WorkerTx>) -> Self {
+    pub fn new(workers: Vec<WorkerTx>, auth: Option<(String, String)>) -> Self {
         Self {
             workers: Arc::new(workers),
+            auth: Arc::new(auth),
         }
     }
 
     pub async fn start(&self) -> anyhow::Result<()> {
         let listener = TcpListener::bind("0.0.0.0:8383").await?;
         info!(
-            "listening on 0.0.0.0:8383 with {} workers",
-            self.workers.len()
+            "listening on 0.0.0.0:8383 with {} workers (auth {})",
+            self.workers.len(),
+            if self.auth.is_some() { "on" } else { "off" }
         );
 
         loop {
             let (socket, peer) = listener.accept().await?;
             let workers = Arc::clone(&self.workers);
+            let auth = Arc::clone(&self.auth);
 
             tokio::spawn(async move {
-                if let Err(e) = handle_conn(socket, workers).await {
+                if let Err(e) = handle_conn(socket, workers, auth).await {
                     error!("connection {peer} ended: {e}");
                 }
             });
@@ -72,14 +77,36 @@ enum Plan {
 async fn handle_conn(
     socket: tokio::net::TcpStream,
     workers: Arc<Vec<WorkerTx>>,
+    auth: Arc<Option<(String, String)>>,
 ) -> anyhow::Result<()> {
     let framed = Framed::new(socket, SimpleCodec);
     let (mut writer, mut reader) = framed.split();
 
-    // 1) Handshake must come first.
+    // 1) Handshake must come first, and the server always replies OK/ERR so the
+    // client knows whether it is authenticated before sending commands.
     match reader.next().await {
         Some(Ok(frame)) if frame.header == FrameKind::HandShake => {
-            info!("handshake success");
+            let (user, pass) = parse_credentials(&frame.payload);
+            let ok = match &*auth {
+                None => true,
+                Some((u, p)) => user == u.as_bytes() && pass == p.as_bytes(),
+            };
+            let payload = if ok {
+                Bytes::from_static(b"OK")
+            } else {
+                Bytes::from_static(b"ERR auth failed")
+            };
+            writer
+                .send(Frame {
+                    header: FrameKind::Response,
+                    req_id: frame.req_id,
+                    payload,
+                })
+                .await?;
+            if !ok {
+                return Ok(());
+            }
+            info!("handshake ok");
         }
         Some(Ok(frame)) => {
             writer
@@ -87,7 +114,7 @@ async fn handle_conn(
                     header: FrameKind::Response,
                     req_id: frame.req_id,
                     payload: Bytes::from_static(
-                        b"Please complete handshake process before sending commands",
+                        b"ERR complete handshake before sending commands",
                     ),
                 })
                 .await?;
@@ -159,6 +186,19 @@ async fn handle_conn(
     drop(reply_tx);
     let _ = writer_task.await;
     Ok(())
+}
+
+/// Parse a handshake payload `[ulen:u16 BE][username][password]`. An empty
+/// payload yields empty credentials (used when auth is disabled).
+fn parse_credentials(p: &[u8]) -> (&[u8], &[u8]) {
+    if p.len() < 2 {
+        return (&[], &[]);
+    }
+    let ulen = u16::from_be_bytes([p[0], p[1]]) as usize;
+    if p.len() < 2 + ulen {
+        return (&[], &[]);
+    }
+    (&p[2..2 + ulen], &p[2 + ulen..])
 }
 
 /// Turn a decoded frame into a plan. Pure routing — no awaiting, no sending.

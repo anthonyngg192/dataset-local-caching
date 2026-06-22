@@ -48,9 +48,31 @@ For reference, the v1 envelope is `[header:u8][len:u16 BE][payload]` — no
 
 ## Handshake
 
-The first frame on a connection must be `HandShake` (`header=1`, `req_id=0`,
-`len=0`). The server does **not** reply to it. After that, requests may flow.
-Sending anything else first gets an error Response and the connection is closed.
+The first frame on a connection must be `HandShake` (`header=1`, `req_id=0`),
+carrying credentials in its payload:
+
+```
+ bytes 0-1            ulen bytes      remaining bytes
+┌──────────────────┬──────────────┬────────────────────┐
+│ ulen (u16 BE)    │   username   │      password      │
+└──────────────────┴──────────────┴────────────────────┘
+```
+
+An empty payload (`len=0`) means no credentials.
+
+The server **replies with one `Response`** frame (echoing `req_id=0`):
+
+- `OK` — authenticated (or auth is disabled server-side); the client may now send
+  requests.
+- `ERR auth failed` — credentials rejected; the server closes the connection.
+
+Auth is enabled on the server only when both `DATASET_USERNAME` and
+`DATASET_PASSWORD` are set; otherwise any handshake (even empty) gets `OK`.
+Sending a non-handshake frame first gets an `ERR` Response and the connection is
+closed.
+
+> Credentials cross the wire in plaintext — run behind TLS (or a trusted network)
+> if that matters. Comparison is not constant-time yet.
 
 ## Request payload (`header=3`)
 

@@ -30,43 +30,59 @@ This produces two binaries:
 cargo run --release --bin dataset-local
 ```
 
-It binds `0.0.0.0:8383` and spawns `next_power_of_two(num_cpus)` workers. You
-should see:
+It binds `0.0.0.0:8383` and spawns `next_power_of_two(num_cpus)` workers.
 
+### Configuration
+
+Config comes from environment variables, auto-loaded from a `.env` file in the
+working directory if present (real env vars override the file). Copy the template:
+
+```bash
+cp .env.example .env   # then edit
+cargo run --release    # picks up .env automatically
 ```
-INFO dataset_local: spawned 8 workers
-INFO dataset_local::server: listening on 0.0.0.0:8383 with 8 workers
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `WORKERS` | CPU count | Shard/worker count (rounded up to a power of two). |
+| `DATASET_USERNAME` | — | Enable auth: required username (set with `DATASET_PASSWORD`). |
+| `DATASET_PASSWORD` | — | Required password. Auth is **on** only when both are set. |
+| `RUST_LOG` | `info` | Log level, e.g. `RUST_LOG=debug`. |
+
+`.env` is git-ignored (keep secrets out of the repo); `.env.example` is the
+tracked template. Overriding still works inline:
+
+```bash
+WORKERS=4 DATASET_USERNAME=admin DATASET_PASSWORD=secret cargo run --release
 ```
 
-Logging is controlled by `RUST_LOG`, e.g. `RUST_LOG=debug cargo run`.
+When auth is on, the client must send the username/password in its handshake (see
+[PROTOCOL.md](PROTOCOL.md#handshake)); the client libraries take them as options.
 
-## Quick manual test
+### Docker
 
-A client must send a handshake frame first, then request frames. This Python
-snippet exercises SET / GET / DEL / heartbeat against a running server:
-
-```python
-import socket, struct
-
-def frame(header, payload=b""):
-    return bytes([header]) + struct.pack(">H", len(payload)) + payload
-
-def request(op, key, value=b""):                       # op: 1=GET 2=SET 3=DEL
-    return frame(3, bytes([op]) + struct.pack(">H", len(key)) + key + value)
-
-def read(s):
-    head = s.recv(3)
-    length = struct.unpack(">H", head[1:3])[0]
-    return head[0], (s.recv(length) if length else b"")
-
-s = socket.create_connection(("127.0.0.1", 8383))
-s.sendall(frame(1))                                    # handshake (no reply)
-s.sendall(request(2, b"hello", b"world")); print(read(s))   # -> (4, b'OK')
-s.sendall(request(1, b"hello"));            print(read(s))   # -> (4, b'world')
-s.sendall(request(3, b"hello"));            print(read(s))   # -> (4, b'1')
-s.sendall(request(1, b"hello"));            print(read(s))   # -> (4, b'(nil)')
-s.close()
+```bash
+docker build -t dataset-local .
+docker run --rm -p 8383:8383 \
+  -e DATASET_USERNAME=admin -e DATASET_PASSWORD=secret \
+  -e WORKERS=4 \
+  dataset-local
 ```
+
+Multi-stage build → a small `debian:bookworm-slim` image running as a non-root
+user. Auth/worker config is passed via `-e` env vars.
+
+## Quick test
+
+Use a client library (see [Clients](#clients)) — they speak the multiplexed v2
+protocol and run a built-in smoke test against a live server:
+
+```bash
+node clients/node/dataset-client.mjs           # Node
+cd clients/rust && cargo run --example smoke    # Rust
+```
+
+For the raw wire format (frames, handshake, op codes) see [PROTOCOL.md](PROTOCOL.md).
 
 ## Benchmark
 
@@ -135,33 +151,19 @@ only shows under skewed/hot-shard load.
 > `BufReader`; without it, the client itself caps throughput at deep pipelines
 > (≈2× lower) — benchmark the harness, not just the server.
 
-### vs Redis 7.2.6 (same machine, single-threaded)
+### Two axes: pipeline depth vs connection count
 
-Same box, same session, `redis-benchmark -t get -c 64 -d 64 -r 100000 -P <depth>`
-against our 90%-read mixed workload. Redis is single-threaded; we shard across
-all cores:
+Throughput scales along two independent axes:
 
-| `--pipeline` | dataset-local | Redis | notes |
-|---:|---:|---:|:--|
-| 1 | ~170k ops/s | ~150k ops/s | we lead — no event-loop overhead at depth 1 |
-| 8 | ~780k ops/s | ~1.19M ops/s | Redis ~1.5× |
-| 32 | ~1.53M ops/s | ~2.24M ops/s | Redis ~1.5× |
-| 128 | ~1.89M ops/s | ~2.81M ops/s | Redis ~1.5× |
+- **Pipeline depth** (requests in flight per connection) — amortizes syscalls;
+  this is what takes a single connection from ~170k to ~1.9M ops/s.
+- **Connection count** — spreads load across all cores. A request-response
+  workload (one outstanding request per connection) leans on this axis, and it
+  keeps climbing as connections grow rather than plateauing on one thread.
 
-Two axes pull in opposite directions: **scaling pipeline depth favors Redis**
-(one thread swallows a whole pipeline with zero coordination), while **scaling
-connection count favors us** (we spread across all cores; a single-threaded
-server plateaus and even degrades past ~128 connections). The realistic
-request-response workload (many connections, no deep pipelining) is the
-connection axis — our home turf, where we beat Redis and the lead widens as
-connections grow. Adding worker shards does *not* help yet: a single worker is
-~8% busy, so the store is never the bottleneck until per-op work gets heavy
-(LRU, TTL).
-
-```
-=== results === (--pipeline 32)
-throughput  : 1531190 ops/sec
-```
+Adding *worker shards* does **not** help today: a single worker sits ~8% busy, so
+the store is never the bottleneck — that only changes once per-op work gets heavy
+(LRU, TTL), which is exactly what the sharded design is built for.
 
 > **Tip:** always benchmark the `--release` build of *both* binaries. Debug
 > builds are several times slower and will give misleading numbers. Start with
@@ -178,20 +180,40 @@ API:
 - **Node** — [`clients/node/dataset-client.mjs`](clients/node/dataset-client.mjs)
   ```js
   import { DatasetClient } from './clients/node/dataset-client.mjs';
-  const c = new DatasetClient({ port: 8383 });
-  await c.connect();
+  const c = new DatasetClient({ port: 8383, username: 'admin', password: 'secret' });
+  await c.connect();              // rejects if auth fails
   await c.set('hello', 'world');
-  await c.get('hello'); // Buffer 'world' | null
+  await c.get('hello');           // Buffer 'world' | null
   ```
 - **Rust** — [`clients/rust`](clients/rust) (standalone crate)
   ```rust
-  let c = dataset_client::Client::connect("127.0.0.1:8383", 256).await?;
+  // connect(addr, max_inflight, username, password) — pass "" "" when auth is off
+  let c = dataset_client::Client::connect("127.0.0.1:8383", 256, "admin", "secret").await?;
   c.set(b"hello", b"world").await;
-  c.get(b"hello").await; // Some(Bytes) | None
+  c.get(b"hello").await;          // Some(Bytes) | None
   ```
 
 Run their smoke tests against a live server: `node clients/node/dataset-client.mjs`
 and `cd clients/rust && cargo run --example smoke`.
+
+### CLI (REPL)
+
+A redis-cli-style interactive shell, built on the Rust client:
+
+```bash
+cd clients/rust
+cargo run --bin dataset-cli -- --addr 127.0.0.1:8383 --user admin --pass secret
+# dataset> set hello world
+# OK
+# dataset> get hello
+# world
+# dataset> del hello
+# (integer) 1
+```
+
+`--user`/`--pass` are optional (default to `DATASET_USERNAME`/`DATASET_PASSWORD`
+env, or empty when the server has auth off). Commands: `get`, `set`, `del`,
+`help`, `quit`.
 
 ## Project layout
 
@@ -209,7 +231,8 @@ src/
     └── bench.rs     # load generator
 clients/
 ├── node/            # Node.js client library
-└── rust/            # Rust client crate
+└── rust/            # Rust client crate + `dataset-cli` REPL binary
+Dockerfile           # multi-stage build → slim runtime image
 PROTOCOL.md          # wire protocol spec (the shared contract)
 ARCHITECTURE.md      # design + threading model
 ```

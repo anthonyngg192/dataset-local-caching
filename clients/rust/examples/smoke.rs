@@ -5,7 +5,7 @@ use dataset_client::Client;
 
 #[tokio::main]
 async fn main() {
-    let c = Client::connect("127.0.0.1:8383", 256).await.unwrap();
+    let c = Client::connect("127.0.0.1:8383", 256, "", "").await.unwrap();
 
     println!("set  -> {}", c.set(b"hello", b"world").await);
     println!(

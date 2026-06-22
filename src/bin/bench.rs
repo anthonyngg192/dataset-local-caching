@@ -131,11 +131,13 @@ async fn run_connection(cfg: Config, conn_id: usize, ops: usize) -> Vec<u64> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    // Handshake (no response expected). v2 envelope: header + req_id + len.
+    // Handshake (empty credentials → ok when auth is disabled). The server now
+    // replies OK/ERR, so consume that one frame before issuing requests.
     write_half
         .write_all(&[HDR_HANDSHAKE, 0, 0, 0, 0, 0, 0])
         .await
         .expect("handshake write failed");
+    read_response(&mut reader).await.expect("handshake reply failed");
 
     let value = vec![b'x'; cfg.value_size];
     let depth = cfg.pipeline.max(1);
