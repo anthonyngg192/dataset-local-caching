@@ -45,6 +45,8 @@ cargo run --release    # picks up .env automatically
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `WORKERS` | CPU count | Shard/worker count (rounded up to a power of two). |
+| `DATA_DIR` | `data` | Where each shard persists (`data/shard-{id}/cool.log` + `backup.log`). |
+| `MAX_MEMORY_MB` | `0` (unlimited) | RAM **cache** budget across shards. Per shard, evicts at 90% down to 80%; evicted values stay on disk and are read back on demand (lossless tiering). `0` caches everything. |
 | `DATASET_USERNAME` | — | Enable auth: required username (set with `DATASET_PASSWORD`). |
 | `DATASET_PASSWORD` | — | Required password. Auth is **on** only when both are set. |
 | `RUST_LOG` | `info` | Log level, e.g. `RUST_LOG=debug`. |
@@ -235,6 +237,7 @@ clients/
 Dockerfile           # multi-stage build → slim runtime image
 PROTOCOL.md          # wire protocol spec (the shared contract)
 ARCHITECTURE.md      # design + threading model
+DESIGN.md            # caching / eviction / tiering roadmap (LRU, TTL, disk)
 ```
 
 ---

@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use bytes::Bytes;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -12,9 +14,9 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(rx: UnboundedReceiver<WorkerCommand>) -> Self {
+    pub fn new(rx: UnboundedReceiver<WorkerCommand>, budget_bytes: usize, dir: &Path) -> Self {
         Self {
-            worker: Worker::start(),
+            worker: Worker::start(budget_bytes, dir),
             rx,
         }
     }
@@ -34,10 +36,17 @@ impl State {
                             let payload = self.apply(op);
                             let _ = reply.send((req_id, payload));
                         }
+                        // After acking: push disk writes to the OS, then evict.
+                        // (Both off the client's response latency path.)
+                        self.worker.flush_os();
+                        self.worker.evict_to_budget();
                     }
                     None => break, // all connections dropped
                 },
-                _ = tick.tick() => self.worker.expire_due(256),
+                _ = tick.tick() => {
+                    self.worker.fsync(); // batched durability
+                    self.worker.expire_due(256);
+                }
             }
         }
     }

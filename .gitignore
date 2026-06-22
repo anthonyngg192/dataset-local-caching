@@ -2,3 +2,4 @@
 clients/rust/target
 node_modules
 .env
+/data
