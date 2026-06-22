@@ -228,6 +228,14 @@ fn plan_op(worker_count: usize, cmd: ClientCommand) -> Plan {
             shard: shard(&key),
             op: WorkerOp::Set { key, value },
         },
+        ClientCommand::SetEx { key, value, ttl_ms } => Plan::Op {
+            shard: shard(&key),
+            op: WorkerOp::SetEx {
+                key,
+                value,
+                ttl: std::time::Duration::from_millis(ttl_ms as u64),
+            },
+        },
         ClientCommand::Del { key } => Plan::Op {
             shard: shard(&key),
             op: WorkerOp::Del { key },

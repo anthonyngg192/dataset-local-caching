@@ -68,12 +68,29 @@ async fn main() {
                 let ok = client.set(key.as_bytes(), value.as_bytes()).await;
                 println!("{}", if ok { "OK" } else { "ERR" });
             }
+            "setex" if !rest.is_empty() => {
+                // setex <key> <ttl_ms> <value...>
+                let mut parts = rest.splitn(3, ' ');
+                match (
+                    parts.next(),
+                    parts.next().and_then(|s| s.parse::<u32>().ok()),
+                ) {
+                    (Some(key), Some(ttl_ms)) => {
+                        let value = parts.next().unwrap_or("");
+                        let ok = client.setex(key.as_bytes(), value.as_bytes(), ttl_ms).await;
+                        println!("{}", if ok { "OK" } else { "ERR" });
+                    }
+                    _ => eprintln!("ERR usage: setex <key> <ttl_ms> <value...>"),
+                }
+            }
             "del" if !rest.is_empty() => {
                 let n = if client.del(rest.as_bytes()).await { 1 } else { 0 };
                 println!("(integer) {n}");
             }
             "get" | "set" | "del" => eprintln!("ERR usage: {cmd} <key> ..."),
-            "help" => println!("get <key> | set <key> <value...> | del <key> | quit"),
+            "help" => println!(
+                "get <key> | set <key> <value...> | setex <key> <ttl_ms> <value...> | del <key> | quit"
+            ),
             "quit" | "exit" => break,
             other => eprintln!("ERR unknown command '{other}'"),
         }

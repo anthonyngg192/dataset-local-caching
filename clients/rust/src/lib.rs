@@ -25,6 +25,7 @@ const REQUEST: u8 = 3;
 const OP_GET: u8 = 1;
 const OP_SET: u8 = 2;
 const OP_DEL: u8 = 3;
+const OP_SETEX: u8 = 4;
 
 /// Outstanding requests, indexed by `req_id` (= slot). A fixed array of
 /// `oneshot` senders plus a free list — O(1) allocate/lookup, minimal locking.
@@ -105,6 +106,17 @@ impl Client {
 
     pub async fn set(&self, key: &[u8], value: &[u8]) -> bool {
         self.call(encode(OP_SET, key, value)).await.as_ref() == b"OK"
+    }
+
+    /// SET with a time-to-live in milliseconds.
+    pub async fn setex(&self, key: &[u8], value: &[u8], ttl_ms: u32) -> bool {
+        let mut p = Vec::with_capacity(3 + key.len() + 4 + value.len());
+        p.push(OP_SETEX);
+        p.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        p.extend_from_slice(key);
+        p.extend_from_slice(&ttl_ms.to_be_bytes());
+        p.extend_from_slice(value);
+        self.call(p).await.as_ref() == b"OK"
     }
 
     pub async fn del(&self, key: &[u8]) -> bool {

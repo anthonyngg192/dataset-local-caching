@@ -17,6 +17,7 @@ const REQUEST = 3;
 const OP_GET = 1;
 const OP_SET = 2;
 const OP_DEL = 3;
+const OP_SETEX = 4;
 
 const NIL = Buffer.from('(nil)');
 
@@ -88,6 +89,19 @@ export class DatasetClient {
     payload.writeUInt16BE(k.length, 1);
     k.copy(payload, 3);
     v.copy(payload, 3 + k.length);
+    const res = await this._send(payload);
+    return res.toString() === 'OK';
+  }
+
+  async setex(key, value, ttlMs) {
+    const k = Buffer.from(key);
+    const v = Buffer.from(value);
+    const payload = Buffer.allocUnsafe(3 + k.length + 4 + v.length);
+    payload[0] = OP_SETEX;
+    payload.writeUInt16BE(k.length, 1);
+    k.copy(payload, 3);
+    payload.writeUInt32BE(ttlMs >>> 0, 3 + k.length);
+    v.copy(payload, 3 + k.length + 4);
     const res = await this._send(payload);
     return res.toString() === 'OK';
   }

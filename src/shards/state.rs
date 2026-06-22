@@ -20,12 +20,24 @@ impl State {
     }
 
     pub async fn start_worker(mut self) {
-        while let Some(WorkerCommand::Batch { ops, reply }) = self.rx.recv().await {
-            // Apply each op and send its tagged response straight back. Order is
-            // irrelevant — the client reorders by req_id.
-            for (req_id, op) in ops {
-                let payload = self.apply(op);
-                let _ = reply.send((req_id, payload));
+        // The shard self-expires on a timer. Lazy expiration handles correctness
+        // on every read; this just reclaims memory from keys nobody touches.
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+
+        loop {
+            tokio::select! {
+                msg = self.rx.recv() => match msg {
+                    Some(WorkerCommand::Batch { ops, reply }) => {
+                        // Apply each op and send its tagged response straight back.
+                        // Order is irrelevant — the client reorders by req_id.
+                        for (req_id, op) in ops {
+                            let payload = self.apply(op);
+                            let _ = reply.send((req_id, payload));
+                        }
+                    }
+                    None => break, // all connections dropped
+                },
+                _ = tick.tick() => self.worker.expire_due(256),
             }
         }
     }
@@ -35,6 +47,10 @@ impl State {
             WorkerOp::Get { key } => self.worker.get(&key).unwrap_or(RESP_NIL),
             WorkerOp::Set { key, value } => {
                 self.worker.set(key, value);
+                RESP_OK
+            }
+            WorkerOp::SetEx { key, value, ttl } => {
+                self.worker.set_ex(key, value, ttl);
                 RESP_OK
             }
             WorkerOp::Del { key } => {

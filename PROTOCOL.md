@@ -83,9 +83,18 @@ closed.
 └───────┴──────────────────┴─────────────┴────────────────────┘
 ```
 
-- `op`: `1 = GET`, `2 = SET`, `3 = DEL`.
+- `op`: `1 = GET`, `2 = SET`, `3 = DEL`, `4 = SETEX`.
 - `GET` / `DEL` ignore everything after the key.
-- `SET` treats all remaining bytes as the value.
+- `SET` treats all remaining bytes as the value (and clears any existing TTL).
+- `SETEX` inserts a `ttl_ms` (`u32` BE, milliseconds) between the key and the
+  value: `[op=4][klen:u16][key][ttl_ms:u32][value]`. The key expires that many
+  ms after the server receives it.
+
+Expiration is **lazy + active**: an expired key reads as a miss (and is dropped)
+on the next access, and each shard also sweeps its own due keys on a timer — so a
+logically-expired key is never served, and untouched expired keys are reclaimed
+without scanning the keyspace. A later `SET`/`SETEX` on an expired-but-uncollected
+key simply overwrites it.
 
 ## Response payload (`header=4`)
 

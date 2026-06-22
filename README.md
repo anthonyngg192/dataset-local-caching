@@ -212,8 +212,8 @@ cargo run --bin dataset-cli -- --addr 127.0.0.1:8383 --user admin --pass secret
 ```
 
 `--user`/`--pass` are optional (default to `DATASET_USERNAME`/`DATASET_PASSWORD`
-env, or empty when the server has auth off). Commands: `get`, `set`, `del`,
-`help`, `quit`.
+env, or empty when the server has auth off). Commands: `get`, `set`,
+`setex <key> <ttl_ms> <value>`, `del`, `help`, `quit`.
 
 ## Project layout
 

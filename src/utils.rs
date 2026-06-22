@@ -1,13 +1,16 @@
+use std::time::Duration;
+
 use anyhow::{Result, bail};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
 // Request payload wire format:
-//   [op:u8][klen:u16 be][key bytes][value bytes (chỉ SET)]
-// op: 1 = GET, 2 = SET, 3 = DEL
+//   [op:u8][klen:u16 be][key bytes][value bytes]
+//   SETEX inserts a 4-byte ttl_ms between the key and the value.
 const OP_GET: u8 = 1;
 const OP_SET: u8 = 2;
 const OP_DEL: u8 = 3;
+const OP_SETEX: u8 = 4;
 
 // Ready-made response payloads, shared by the worker (which now formats replies)
 // and the server (immediate replies). `Bytes::from_static` is a const fn so these
@@ -24,6 +27,7 @@ pub const RESP_WORKER_GONE: Bytes = Bytes::from_static(b"ERR worker dropped resp
 pub enum WorkerOp {
     Get { key: Bytes },
     Set { key: Bytes, value: Bytes },
+    SetEx { key: Bytes, value: Bytes, ttl: Duration },
     Del { key: Bytes },
 }
 
@@ -43,6 +47,7 @@ pub enum WorkerCommand {
 pub enum ClientCommand {
     Get { key: Bytes },
     Set { key: Bytes, value: Bytes },
+    SetEx { key: Bytes, value: Bytes, ttl_ms: u32 },
     Del { key: Bytes },
 }
 
@@ -62,6 +67,19 @@ impl ClientCommand {
                 Ok(ClientCommand::Set {
                     key,
                     value: Bytes::copy_from_slice(after),
+                })
+            }
+            OP_SETEX => {
+                // After the key: [ttl_ms:u32 BE][value].
+                let (key, after) = read_field(rest)?;
+                if after.len() < 4 {
+                    bail!("truncated ttl");
+                }
+                let ttl_ms = u32::from_be_bytes([after[0], after[1], after[2], after[3]]);
+                Ok(ClientCommand::SetEx {
+                    key,
+                    value: Bytes::copy_from_slice(&after[4..]),
+                    ttl_ms,
                 })
             }
             OP_DEL => {
