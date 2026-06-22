@@ -2,32 +2,18 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use tokio::{
-    net::TcpListener,
-    sync::{mpsc, oneshot},
-};
+use tokio::{net::TcpListener, sync::mpsc};
 use tokio_util::codec::Framed;
 use tracing::{error, info};
 
 use crate::{
     common::{Frame, FrameKind, SimpleCodec},
     hashing::route_hash,
-    utils::{ClientCommand, WorkerCommand},
+    utils::{ClientCommand, RESP_ONE, WorkerCommand, WorkerOp},
 };
 
-/// Max number of in-flight requests buffered per connection before the reader
-/// stops pulling from the socket. This bound is what turns "don't wait for the
-/// response" into safe backpressure: when the queue is full the reader blocks on
-/// `send().await`, the kernel TCP window closes, and the client is throttled —
-/// no request is lost and memory stays bounded.
-const PIPELINE_DEPTH: usize = 1024;
-
-// Pre-built response payloads for the common cases.
-const RESP_OK: Bytes = Bytes::from_static(b"OK");
-const RESP_NIL: Bytes = Bytes::from_static(b"(nil)");
-const RESP_ONE: Bytes = Bytes::from_static(b"1");
-const RESP_ZERO: Bytes = Bytes::from_static(b"0");
-const RESP_WORKER_GONE: Bytes = Bytes::from_static(b"ERR worker dropped response");
+/// Upper bound on how many frames a single reader pass groups into one batch.
+const MAX_BATCH: usize = 1024;
 
 #[derive(Clone)]
 pub struct WorkerTx {
@@ -77,38 +63,10 @@ impl ServerListener {
     }
 }
 
-/// A response that has been routed but not yet produced. The writer pulls these
-/// in FIFO order and awaits each one, so responses go out in exactly the order
-/// the requests arrived — no correlation id needed.
-enum Pending {
-    /// Already-known payload (heartbeat, handshake reply, parse/routing errors).
+/// The plan for one decoded frame: an immediate reply, or an op routed to a shard.
+enum Plan {
     Immediate(Bytes),
-    /// Awaiting a worker reply; the variant remembers how to format it.
-    Get(oneshot::Receiver<Option<Bytes>>),
-    Set(oneshot::Receiver<bool>),
-    Del(oneshot::Receiver<bool>),
-}
-
-impl Pending {
-    async fn resolve(self) -> Bytes {
-        match self {
-            Pending::Immediate(payload) => payload,
-            Pending::Get(rx) => match rx.await {
-                Ok(Some(value)) => value,
-                Ok(None) => RESP_NIL,
-                Err(_) => RESP_WORKER_GONE,
-            },
-            Pending::Set(rx) => match rx.await {
-                Ok(_) => RESP_OK,
-                Err(_) => RESP_WORKER_GONE,
-            },
-            Pending::Del(rx) => match rx.await {
-                Ok(true) => RESP_ONE,
-                Ok(false) => RESP_ZERO,
-                Err(_) => RESP_WORKER_GONE,
-            },
-        }
-    }
+    Op { shard: usize, op: WorkerOp },
 }
 
 async fn handle_conn(
@@ -123,10 +81,11 @@ async fn handle_conn(
         Some(Ok(frame)) if frame.header == FrameKind::HandShake => {
             info!("handshake success");
         }
-        Some(Ok(_)) => {
+        Some(Ok(frame)) => {
             writer
                 .send(Frame {
                     header: FrameKind::Response,
+                    req_id: frame.req_id,
                     payload: Bytes::from_static(
                         b"Please complete handshake process before sending commands",
                     ),
@@ -138,16 +97,17 @@ async fn handle_conn(
         None => anyhow::bail!("connection ended during handshake"),
     }
 
-    // 2) Ordered completion queue connecting the reader to the writer.
-    let (queue_tx, mut queue_rx) = mpsc::channel::<Pending>(PIPELINE_DEPTH);
+    // 2) Per-connection reply channel. Workers (and the reader, for immediate
+    // replies) push `(req_id, payload)` here; the writer drains and emits them in
+    // whatever order they arrive — the client reorders by req_id.
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<(u32, Bytes)>();
 
-    // Writer half: drain pending responses in FIFO order.
     let writer_task = tokio::spawn(async move {
-        while let Some(pending) = queue_rx.recv().await {
-            let payload = pending.resolve().await;
+        while let Some((req_id, payload)) = reply_rx.recv().await {
             if writer
                 .send(Frame {
                     header: FrameKind::Response,
+                    req_id,
                     payload,
                 })
                 .await
@@ -158,77 +118,79 @@ async fn handle_conn(
         }
     });
 
-    // Reader half: decode frames, route them, hand the pending response to the
-    // writer — without waiting for the worker. `queue_tx.send().await` applies
-    // backpressure once PIPELINE_DEPTH requests are outstanding.
-    while let Some(frame) = reader.next().await {
-        let frame = frame?;
-        let pending = route_frame(&workers, frame);
-        if queue_tx.send(pending).await.is_err() {
-            break; // writer task gone
+    // 3) Reader: decode a pass of frames, send immediates straight back, bucket
+    // ops by shard, and dispatch one batch per shard. No ordering to maintain —
+    // each batch carries this connection's reply channel.
+    let mut reader = reader.ready_chunks(MAX_BATCH);
+    let mut groups: Vec<Vec<(u32, WorkerOp)>> = (0..workers.len()).map(|_| Vec::new()).collect();
+
+    while let Some(chunk) = reader.next().await {
+        for frame in chunk {
+            let frame = frame?;
+            let req_id = frame.req_id;
+            match plan(&workers, frame) {
+                Plan::Immediate(payload) => {
+                    if reply_tx.send((req_id, payload)).is_err() {
+                        return Ok(()); // writer gone
+                    }
+                }
+                Plan::Op { shard, op } => groups[shard].push((req_id, op)),
+            }
+        }
+
+        for (shard, ops) in groups.iter_mut().enumerate() {
+            if ops.is_empty() {
+                continue;
+            }
+            let batch: Vec<(u32, WorkerOp)> = ops.drain(..).collect();
+            if workers[shard]
+                .send(WorkerCommand::Batch {
+                    ops: batch,
+                    reply: reply_tx.clone(),
+                })
+                .is_err()
+            {
+                return Ok(()); // worker gone
+            }
         }
     }
 
-    // Closing queue_tx lets the writer drain remaining responses and finish.
-    drop(queue_tx);
+    // Dropping our sender lets the writer finish once all worker clones drain.
+    drop(reply_tx);
     let _ = writer_task.await;
     Ok(())
 }
 
-/// Turn a decoded frame into a `Pending` response, dispatching to a worker where
-/// needed. Does not await the worker.
-fn route_frame(workers: &[WorkerTx], frame: Frame) -> Pending {
+/// Turn a decoded frame into a plan. Pure routing — no awaiting, no sending.
+fn plan(workers: &[WorkerTx], frame: Frame) -> Plan {
     match frame.header {
         FrameKind::Request => match ClientCommand::parse(&frame.payload) {
-            Ok(cmd) => dispatch(workers, cmd),
-            Err(e) => Pending::Immediate(Bytes::from(format!("ERR {e}"))),
+            Ok(cmd) => plan_op(workers.len(), cmd),
+            Err(e) => Plan::Immediate(Bytes::from(format!("ERR {e}"))),
         },
-        FrameKind::Heartbeat => Pending::Immediate(RESP_ONE),
+        FrameKind::Heartbeat => Plan::Immediate(RESP_ONE),
         FrameKind::HandShake => {
-            Pending::Immediate(Bytes::from_static(b"Handshake process already completed"))
+            Plan::Immediate(Bytes::from_static(b"Handshake process already completed"))
         }
-        FrameKind::Response => Pending::Immediate(Bytes::from_static(b"Invalid command")),
+        FrameKind::Response => Plan::Immediate(Bytes::from_static(b"Invalid command")),
     }
 }
 
-/// Route a command to its owning worker and return the pending reply handle.
-fn dispatch(workers: &[WorkerTx], cmd: ClientCommand) -> Pending {
+/// Route a command to its owning shard.
+fn plan_op(worker_count: usize, cmd: ClientCommand) -> Plan {
+    let shard = |key: &[u8]| route_hash(key, worker_count).shard_id;
     match cmd {
-        ClientCommand::Get { key } => {
-            let (tx, rx) = oneshot::channel();
-            match worker_for(workers, &key).send(WorkerCommand::Get {
-                key: key.to_vec(),
-                tx,
-            }) {
-                Ok(()) => Pending::Get(rx),
-                Err(e) => Pending::Immediate(Bytes::from(format!("ERR {e}"))),
-            }
-        }
-        ClientCommand::Set { key, value } => {
-            let (tx, rx) = oneshot::channel();
-            match worker_for(workers, &key).send(WorkerCommand::Set {
-                key: key.to_vec(),
-                value,
-                tx,
-            }) {
-                Ok(()) => Pending::Set(rx),
-                Err(e) => Pending::Immediate(Bytes::from(format!("ERR {e}"))),
-            }
-        }
-        ClientCommand::Del { key } => {
-            let (tx, rx) = oneshot::channel();
-            match worker_for(workers, &key).send(WorkerCommand::Del {
-                key: key.to_vec(),
-                tx,
-            }) {
-                Ok(()) => Pending::Del(rx),
-                Err(e) => Pending::Immediate(Bytes::from(format!("ERR {e}"))),
-            }
-        }
+        ClientCommand::Get { key } => Plan::Op {
+            shard: shard(&key),
+            op: WorkerOp::Get { key },
+        },
+        ClientCommand::Set { key, value } => Plan::Op {
+            shard: shard(&key),
+            op: WorkerOp::Set { key, value },
+        },
+        ClientCommand::Del { key } => Plan::Op {
+            shard: shard(&key),
+            op: WorkerOp::Del { key },
+        },
     }
-}
-
-fn worker_for<'a>(workers: &'a [WorkerTx], key: &[u8]) -> &'a WorkerTx {
-    let shard = route_hash(key, workers.len()).shard_id;
-    &workers[shard]
 }

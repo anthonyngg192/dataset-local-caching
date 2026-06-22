@@ -16,8 +16,8 @@
 use std::time::Instant;
 
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{TcpStream, tcp::OwnedReadHalf},
 };
 
 // Frame headers (must match src/common.rs).
@@ -91,9 +91,11 @@ fn xorshift(state: &mut u64) -> u64 {
 }
 
 /// Append one encoded request frame to `buf` (does not clear it).
-fn encode_request(buf: &mut Vec<u8>, op: u8, key: &[u8], value: &[u8]) {
+/// v2 envelope: [header:u8][req_id:u32 BE][len:u16 BE][payload].
+fn encode_request(buf: &mut Vec<u8>, req_id: u32, op: u8, key: &[u8], value: &[u8]) {
     let payload_len = 1 + 2 + key.len() + value.len();
     buf.push(HDR_REQUEST);
+    buf.extend_from_slice(&req_id.to_be_bytes());
     buf.extend_from_slice(&(payload_len as u16).to_be_bytes());
     buf.push(op);
     buf.extend_from_slice(&(key.len() as u16).to_be_bytes());
@@ -101,27 +103,37 @@ fn encode_request(buf: &mut Vec<u8>, op: u8, key: &[u8], value: &[u8]) {
     buf.extend_from_slice(value);
 }
 
-async fn read_response(stream: &mut TcpStream) -> std::io::Result<()> {
-    let mut head = [0u8; 3];
-    stream.read_exact(&mut head).await?;
-    let len = u16::from_be_bytes([head[1], head[2]]) as usize;
+/// Read one response frame, returning its req_id. The body is drained but not
+/// inspected (throughput test).
+async fn read_response(reader: &mut BufReader<OwnedReadHalf>) -> std::io::Result<u32> {
+    let mut head = [0u8; 7];
+    reader.read_exact(&mut head).await?;
+    let req_id = u32::from_be_bytes([head[1], head[2], head[3], head[4]]);
+    let len = u16::from_be_bytes([head[5], head[6]]) as usize;
     if len > 0 {
         let mut body = vec![0u8; len];
-        stream.read_exact(&mut body).await?;
+        reader.read_exact(&mut body).await?;
     }
-    Ok(())
+    Ok(req_id)
 }
 
 /// Drives one connection. Returns the latencies (in nanoseconds) it observed.
 async fn run_connection(cfg: Config, conn_id: usize, ops: usize) -> Vec<u64> {
-    let mut stream = TcpStream::connect(&cfg.addr)
+    let stream = TcpStream::connect(&cfg.addr)
         .await
         .expect("connect failed");
     stream.set_nodelay(true).ok();
 
-    // Handshake (no response expected from the server).
-    stream
-        .write_all(&[HDR_HANDSHAKE, 0, 0])
+    // Split so we can buffer the read side: reading responses byte-frame by
+    // byte-frame off the raw socket costs one syscall per `read_exact`; a
+    // BufReader drains many responses per syscall, which matters a lot when a
+    // single batch returns hundreds of small frames.
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // Handshake (no response expected). v2 envelope: header + req_id + len.
+    write_half
+        .write_all(&[HDR_HANDSHAKE, 0, 0, 0, 0, 0, 0])
         .await
         .expect("handshake write failed");
 
@@ -133,6 +145,9 @@ async fn run_connection(cfg: Config, conn_id: usize, ops: usize) -> Vec<u64> {
     let mut rng = 0x9E3779B97F4A7C15u64 ^ (conn_id as u64).wrapping_mul(0xD1B54A32D192ED03);
 
     let read_threshold = (cfg.read_ratio * u64::MAX as f64) as u64;
+    // Monotonic per-connection req_id. With `depth` outstanding at a time, this
+    // acts like a slot window; the server echoes it and we drain by count.
+    let mut req_id: u32 = 0;
 
     // Send `depth` requests, then read all `depth` responses. With depth == 1
     // this is the closed-loop case; larger depths amortize the round-trip and
@@ -144,17 +159,18 @@ async fn run_connection(cfg: Config, conn_id: usize, ops: usize) -> Vec<u64> {
         buf.clear();
         for _ in 0..batch {
             let key = (xorshift(&mut rng) % cfg.keyspace).to_be_bytes();
+            req_id = req_id.wrapping_add(1);
             if xorshift(&mut rng) < read_threshold {
-                encode_request(&mut buf, OP_GET, &key, &[]);
+                encode_request(&mut buf, req_id, OP_GET, &key, &[]);
             } else {
-                encode_request(&mut buf, OP_SET, &key, &value);
+                encode_request(&mut buf, req_id, OP_SET, &key, &value);
             }
         }
 
         let start = Instant::now();
-        stream.write_all(&buf).await.expect("write failed");
+        write_half.write_all(&buf).await.expect("write failed");
         for _ in 0..batch {
-            read_response(&mut stream).await.expect("read failed");
+            read_response(&mut reader).await.expect("read failed");
         }
         latencies.push(start.elapsed().as_nanos() as u64);
 

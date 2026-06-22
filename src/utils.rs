@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use bytes::Bytes;
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 
 // Request payload wire format:
 //   [op:u8][klen:u16 be][key bytes][value bytes (chỉ SET)]
@@ -9,20 +9,33 @@ const OP_GET: u8 = 1;
 const OP_SET: u8 = 2;
 const OP_DEL: u8 = 3;
 
+// Ready-made response payloads, shared by the worker (which now formats replies)
+// and the server (immediate replies). `Bytes::from_static` is a const fn so these
+// are zero-cost to clone.
+pub const RESP_OK: Bytes = Bytes::from_static(b"OK");
+pub const RESP_NIL: Bytes = Bytes::from_static(b"(nil)");
+pub const RESP_ONE: Bytes = Bytes::from_static(b"1");
+pub const RESP_ZERO: Bytes = Bytes::from_static(b"0");
+pub const RESP_WORKER_GONE: Bytes = Bytes::from_static(b"ERR worker dropped response");
+
+/// A single store operation. No reply channel: the worker now formats the whole
+/// batch's responses and returns them together, so the per-op `oneshot` is gone.
+#[derive(Debug)]
+pub enum WorkerOp {
+    Get { key: Bytes },
+    Set { key: Bytes, value: Bytes },
+    Del { key: Bytes },
+}
+
+/// Message sent from a connection to a worker: a batch of `(req_id, op)` plus the
+/// originating connection's reply channel. The worker applies each op and sends
+/// `(req_id, response)` straight back — in any order, no gather, no reorder. The
+/// client matches responses to requests by `req_id`.
 #[derive(Debug)]
 pub enum WorkerCommand {
-    Get {
-        key: Vec<u8>,
-        tx: oneshot::Sender<Option<Bytes>>,
-    },
-    Set {
-        key: Vec<u8>,
-        value: Bytes,
-        tx: oneshot::Sender<bool>,
-    },
-    Del {
-        key: Vec<u8>,
-        tx: oneshot::Sender<bool>,
+    Batch {
+        ops: Vec<(u32, WorkerOp)>,
+        reply: mpsc::UnboundedSender<(u32, Bytes)>,
     },
 }
 
@@ -34,7 +47,6 @@ pub enum ClientCommand {
 }
 
 impl ClientCommand {
-    /// Parse một Request frame payload thành ClientCommand.
     pub fn parse(buf: &Bytes) -> Result<Self> {
         let Some((&op, rest)) = buf.split_first() else {
             bail!("empty request payload");

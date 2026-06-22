@@ -3,7 +3,8 @@ use std::io;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 const MAX_FRAME_SIZE: usize = 64 * 1024;
-const FRAME_HEAD_LEN: usize = 3;
+// v2 envelope: [header:u8][req_id:u32 BE][len:u16 BE][payload]
+const FRAME_HEAD_LEN: usize = 7;
 
 #[repr(u8)]
 #[derive(Debug, PartialEq, Eq)]
@@ -17,6 +18,9 @@ pub enum FrameKind {
 #[derive(Debug)]
 pub struct Frame {
     pub header: FrameKind,
+    /// Client-chosen correlation id, echoed verbatim on the Response. Opaque to
+    /// the server. `0` where unused (handshake).
+    pub req_id: u32,
     pub payload: Bytes,
 }
 
@@ -44,7 +48,8 @@ impl Decoder for SimpleCodec {
             }
         };
 
-        let len = u16::from_be_bytes([src[1], src[2]]) as usize;
+        let req_id = u32::from_be_bytes([src[1], src[2], src[3], src[4]]);
+        let len = u16::from_be_bytes([src[5], src[6]]) as usize;
 
         if len > MAX_FRAME_SIZE {
             return Err(io::Error::new(
@@ -62,6 +67,7 @@ impl Decoder for SimpleCodec {
 
         return Ok(Some(Frame {
             header,
+            req_id,
             payload: data.freeze(),
         }));
     }
@@ -70,9 +76,10 @@ impl Decoder for SimpleCodec {
 impl Encoder<Frame> for SimpleCodec {
     type Error = io::Error;
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), io::Error> {
-        let len = item.payload.len() as u32;
+        let len = item.payload.len() as u16;
         dst.put_u8(item.header as u8);
-        dst.put_u16(len as u16);
+        dst.put_u32(item.req_id);
+        dst.put_u16(len);
         dst.extend_from_slice(&item.payload);
         Ok(())
     }

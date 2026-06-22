@@ -109,27 +109,58 @@ round-trip (`throughput ≈ connections / latency`), **not** by the server. Rais
 the pipeline depth lets multiple requests be in flight per connection and
 exposes the server's real ceiling.
 
-Sweep at 64 connections, 2,000,000 ops, 64B values, 90% reads:
+Sweep at 64 connections, 2,000,000 ops, 64B values, 90% reads. Within one reader
+pass, requests bound for the same shard are batched into a single worker
+message, so one channel send + one task wake-up covers many ops:
 
-| `--pipeline` | throughput | vs closed-loop | p50 latency* | p99 latency* |
-|---:|---:|---:|---:|---:|
-| 1 (closed-loop) | 139,753 ops/s | 1.0× | 0.40 ms | 1.45 ms |
-| 8 | 484,218 ops/s | 3.5× | 0.95 ms | 3.05 ms |
-| 32 | 597,667 ops/s | 4.3× | 3.32 ms | 7.48 ms |
-| 128 | 639,275 ops/s | 4.6× | 10.41 ms | 44.93 ms |
+Numbers below are the **v2 (multiplexed) protocol**, default 8 workers, one
+session:
 
-\*From `--pipeline 8` upward each latency sample is a whole **batch** round-trip,
-not a single op, so the numbers are expected to grow with depth. Throughput
-plateaus around ~640k ops/s — past that, deeper pipelining only inflates latency,
-which means the bottleneck has shifted from the network to the server's
-message-passing layer.
+| `--pipeline` | throughput | vs closed-loop |
+|---:|---:|---:|
+| 1 (closed-loop) | 170,245 ops/s | 1.0× |
+| 8 | 777,183 ops/s | 4.6× |
+| 32 | 1,531,190 ops/s | 9.0× |
+| 128 | 1,893,212 ops/s | 11.1× |
+
+Throughput tops out around 1.5–1.9M ops/s (run dependent); past that, deeper
+pipelining mostly inflates latency, which means the bottleneck has shifted from
+the network to the per-op machinery (2 syscalls + a few task wake-ups per op,
+amortized by batching). v2 vs the older in-order v1 is within noise on uniform
+keys — v2's win is structural (no head-of-line blocking, simpler server), which
+only shows under skewed/hot-shard load.
+
+> Numbers vary ±10–15% run to run on a laptop (thermal + scheduling), so treat
+> them as ballpark, not exact. The load generator reads responses through a
+> `BufReader`; without it, the client itself caps throughput at deep pipelines
+> (≈2× lower) — benchmark the harness, not just the server.
+
+### vs Redis 7.2.6 (same machine, single-threaded)
+
+Same box, same session, `redis-benchmark -t get -c 64 -d 64 -r 100000 -P <depth>`
+against our 90%-read mixed workload. Redis is single-threaded; we shard across
+all cores:
+
+| `--pipeline` | dataset-local | Redis | notes |
+|---:|---:|---:|:--|
+| 1 | ~170k ops/s | ~150k ops/s | we lead — no event-loop overhead at depth 1 |
+| 8 | ~780k ops/s | ~1.19M ops/s | Redis ~1.5× |
+| 32 | ~1.53M ops/s | ~2.24M ops/s | Redis ~1.5× |
+| 128 | ~1.89M ops/s | ~2.81M ops/s | Redis ~1.5× |
+
+Two axes pull in opposite directions: **scaling pipeline depth favors Redis**
+(one thread swallows a whole pipeline with zero coordination), while **scaling
+connection count favors us** (we spread across all cores; a single-threaded
+server plateaus and even degrades past ~128 connections). The realistic
+request-response workload (many connections, no deep pipelining) is the
+connection axis — our home turf, where we beat Redis and the lead widens as
+connections grow. Adding worker shards does *not* help yet: a single worker is
+~8% busy, so the store is never the bottleneck until per-op work gets heavy
+(LRU, TTL).
 
 ```
-=== results === (--pipeline 8)
-throughput  : 484218 ops/sec
-latency (per-batch of 8):
-latency p50 : 0.952 ms
-latency p99 : 3.050 ms
+=== results === (--pipeline 32)
+throughput  : 1531190 ops/sec
 ```
 
 > **Tip:** always benchmark the `--release` build of *both* binaries. Debug
@@ -137,20 +168,50 @@ latency p99 : 3.050 ms
 > `--pipeline 1` to see per-op latency, then raise it (8 → 32 → 128) to find the
 > throughput ceiling.
 
+## Clients
+
+The protocol is multiplexed (see [PROTOCOL.md](PROTOCOL.md)): each request carries
+a `req_id`, responses come back tagged and possibly out of order, and the client
+matches them. That logic lives in the client libraries so apps get a simple async
+API:
+
+- **Node** — [`clients/node/dataset-client.mjs`](clients/node/dataset-client.mjs)
+  ```js
+  import { DatasetClient } from './clients/node/dataset-client.mjs';
+  const c = new DatasetClient({ port: 8383 });
+  await c.connect();
+  await c.set('hello', 'world');
+  await c.get('hello'); // Buffer 'world' | null
+  ```
+- **Rust** — [`clients/rust`](clients/rust) (standalone crate)
+  ```rust
+  let c = dataset_client::Client::connect("127.0.0.1:8383", 256).await?;
+  c.set(b"hello", b"world").await;
+  c.get(b"hello").await; // Some(Bytes) | None
+  ```
+
+Run their smoke tests against a live server: `node clients/node/dataset-client.mjs`
+and `cd clients/rust && cargo run --example smoke`.
+
 ## Project layout
 
 ```
 src/
 ├── main.rs          # bootstrap: worker pool + listener
-├── server.rs        # TCP listener, connection handling, dispatch
-├── common.rs        # frame codec (wire protocol)
+├── server.rs        # TCP listener, reader/writer split, shard routing
+├── common.rs        # frame codec (wire protocol, with req_id)
 ├── hashing.rs       # key -> shard routing
-├── utils.rs         # ClientCommand / WorkerCommand + request parsing
+├── utils.rs         # ClientCommand / WorkerOp / WorkerCommand + parsing
 ├── shards/
 │   ├── state.rs     # per-worker event loop
 │   └── worker.rs    # the HashMap store
 └── bin/
     └── bench.rs     # load generator
+clients/
+├── node/            # Node.js client library
+└── rust/            # Rust client crate
+PROTOCOL.md          # wire protocol spec (the shared contract)
+ARCHITECTURE.md      # design + threading model
 ```
 
 ---

@@ -1,0 +1,14 @@
+# Standalone workspace so it builds independently of the parent server crate.
+[workspace]
+
+[package]
+name = "dataset-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
+
+[[example]]
+name = "smoke"
