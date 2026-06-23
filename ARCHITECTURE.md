@@ -18,12 +18,12 @@ many operations.
 ```
             per connection                          shared worker pool
   ┌───────────────────────────────────┐        ┌───────────────────────────┐
-  │  reader  ── batch (req_id, op) ───────────► │ Worker 0  HashMap (owned) │ s0
+  │  reader  ── batch (req_id, op) ───────────► │ Worker 0  cache+index+disk │ s0
   │   │  (hash(key) & (N-1))           │        ├───────────────────────────┤
-  │   │                                │        │ Worker 1  HashMap (owned) │ s1
+  │   │                                │        │ Worker 1  cache+index+disk │ s1
   │   │                                │        ├───────────────────────────┤
   │   │   reply (req_id, payload)      │        │ ...                       │
-  │   ▼   ◄───────────────────────────────────  │ Worker N-1 HashMap (owned)│ sN
+  │   ▼   ◄───────────────────────────────────  │ Worker N-1 cache+index+disk│ sN
   │  writer ── responses, any order ──► client   └───────────────────────────┘
   └───────────────────────────────────┘          (client reorders by req_id)
 ```
@@ -36,9 +36,10 @@ many operations.
 | [`src/server.rs`](src/server.rs) | TCP listener, per-connection reader/writer split, shard batching, routing. |
 | [`src/common.rs`](src/common.rs) | Wire framing: `Frame` (with `req_id`), `FrameKind`, and the `SimpleCodec` codec. |
 | [`src/hashing.rs`](src/hashing.rs) | `route_hash` — maps a key to a shard id. |
-| [`src/utils.rs`](src/utils.rs) | `ClientCommand` (parsed request), `WorkerOp`, `WorkerCommand::Batch` (internal message). |
-| [`src/shards/state.rs`](src/shards/state.rs) | The per-worker event loop; applies each op and replies tagged with its `req_id`. |
-| [`src/shards/worker.rs`](src/shards/worker.rs) | The actual storage: a `HashMap<Bytes, Bytes>`. |
+| [`src/utils.rs`](src/utils.rs) | `ClientCommand` (GET/SET/SETEX/DEL), `WorkerOp`, `WorkerCommand::Batch`. |
+| [`src/shards/state.rs`](src/shards/state.rs) | Per-worker event loop: applies each op, replies tagged with `req_id`, runs the periodic TTL sweep + fsync. |
+| [`src/shards/worker.rs`](src/shards/worker.rs) | Per-shard store: LRU value cache + key→location index + TTL heap + byte budget. |
+| [`src/shards/disk.rs`](src/shards/disk.rs) | Per-shard persistence: `cool.log` (values) + `backup.log` (index journal); write-through + replay. |
 | [`src/bin/bench.rs`](src/bin/bench.rs) | Standalone load generator (see [README](README.md)). |
 
 ## Threading model
@@ -104,6 +105,40 @@ Ops for different shards complete at different times. With multiplexing that is 
 non-issue: each response carries its `req_id`, so out-of-order completion is the
 expected, correct behavior — the client's outstanding map sorts it out.
 
+## Storage engine (per shard)
+
+Each worker owns a small tiered store — RAM is a cache over a durable disk log,
+so the dataset is bounded by **disk**, not RAM.
+
+- **Index** — `HashMap<key → {val_off, vlen, exp_ms}>` for *every* key. Always in
+  RAM. This bounds the key *count* (~10M short keys per GB of index), not the
+  data size.
+- **Cache** — an LRU of hot values (`lru` crate), bounded by a byte budget
+  (`MAX_MEMORY_MB` split per shard). A GET miss reads the value from disk and
+  re-caches it.
+- **TTL** — `exp_ms` stored per entry as **absolute epoch ms** (survives
+  restart). Lazy on read (an expired key reads as a miss and is dropped) plus a
+  bounded active sweep on a timer, driven by a min-heap.
+
+### Persistence (write-through) + tiering
+
+Two append-only files per shard:
+
+- **`cool.log`** — the value store and source of truth: every write appends
+  `[op][klen][exp_ms][vlen][key][value]`.
+- **`backup.log`** — the index journal: `[op][klen][val_off][vlen][exp_ms][key]`.
+
+Write path: append to both → update index → put in cache → ack. `fsync` is
+batched on the timer tick; flush-to-OS happens after each batch. On restart, the
+small `backup.log` is replayed to rebuild the index (values stay on disk, loaded
+lazily).
+
+**Eviction is lossless.** When the cache passes its 90% high-water mark it drops
+LRU values down to 80% — but only the *cache copy*; the value is already in
+`cool.log` and the index still points at it, so a later GET reads it back. That
+is what lets a 2 GB cache front a much larger on-disk dataset without losing
+cold data.
+
 ## Wire protocol
 
 The full, byte-level spec is in [PROTOCOL.md](PROTOCOL.md). Summary:
@@ -126,9 +161,16 @@ The full, byte-level spec is in [PROTOCOL.md](PROTOCOL.md). Summary:
 ## Design rationale
 
 - **Shared-nothing sharding (Dragonfly-style).** Partitioning the keyspace by
-  hash and pinning each partition to one worker removes lock contention. Adding
-  cores scales the *store* throughput — though for light GET/SET the store is
-  rarely the bottleneck (see trade-offs).
+  hash and pinning each partition to one worker removes lock contention. In
+  principle this scales the *store* across cores — but measured, it does *not*
+  help for in-memory work: a single worker is only ~16% busy at 1.6M ops/s, so
+  the per-op coordination dominates, not the store (see trade-offs). The payoff
+  needs genuinely heavy per-op work (real disk I/O at a scale beyond RAM).
+- **RAM as a cache, not the whole store (the real value).** With tiering, the
+  dataset is bounded by disk, not memory: a fixed RAM budget fronts a much larger
+  durable dataset on disk. This is the point — capacity per GB of RAM — for small,
+  memory-constrained deployments. Throughput vs a single-threaded in-memory store
+  is *not* the selling axis.
 - **Serial per-shard execution (Redis-style).** Within a shard, commands run one
   at a time, so each worker's data structures need no synchronization.
 - **Message passing over shared memory.** mpsc in, mpsc out — ownership is clear
@@ -142,20 +184,26 @@ The full, byte-level spec is in [PROTOCOL.md](PROTOCOL.md). Summary:
 
 ## Known trade-offs / TODO
 
-- **No server-side backpressure (regression from the ordered design).** The reply
-  channel and worker channels are unbounded; the server relies on the client's
-  slot pool to bound in-flight requests. A misbehaving client could grow server
-  memory. Production should add a per-connection semaphore (bounded in-flight)
-  that also drives TCP backpressure.
-- **Store is rarely the bottleneck for plain GET/SET.** A single worker sits
-  ~8% busy at ~1.5M ops/s; adding workers does not help until per-op store work
-  gets heavy (LRU, TTL). Sharding is provisioned for that future, not today's
-  empty store.
-- **`Worker::set` return value is inverted** (`true` when the key already
-  existed). Mapped to `OK` either way, so not observable yet, but should be fixed.
-- **No TTL / expiration**, no `EXISTS` / `INCR` / `MGET`, no LRU eviction, no
-  persistence — the natural next features for a Redis-like cache.
-- **Heartbeat is an echo** (`1`); real liveness/metrics could be layered on top.
+- **No compaction yet.** `cool.log` and `backup.log` are append-only and never
+  reclaimed, so overwrites, deletes (tombstones), and expired records pile up as
+  garbage — the files grow forever and replay slows over time. Compaction
+  (rewrite a clean log, swap it in) is the main missing piece.
+- **Sharding doesn't measurably pay off here.** Across in-RAM, LRU, and
+  page-cached disk tiering, 1 worker ≈ 8 — the per-op coordination dominates. A
+  clean win needs data ≫ RAM hitting real disk (parallel I/O across workers),
+  which we couldn't reproduce on a laptop (the dataset fit the OS page cache).
+- **No server-side backpressure.** Reply and worker channels are unbounded; the
+  server trusts the client's slot pool to bound in-flight requests. A per-
+  connection semaphore (and TCP backpressure) is the fix.
+- **Blocking `pread` in async workers.** A cold read blocks the worker's runtime
+  thread (a simplification). Real async file I/O (or `spawn_blocking`) would be
+  cleaner under heavy cold-read load.
+- **Index bounds key count.** Every key's index entry lives in RAM (~80 B for
+  short keys → ~10M keys/GB). Data size is bounded by disk; key *count* by RAM.
+- **Auth is weak.** Credentials cross the wire in plaintext and the comparison is
+  not constant-time — run behind TLS / a trusted network.
+- **Missing commands & metrics.** No `EXISTS` / `INCR` / `MGET`; heartbeat is a
+  bare echo (`1`).
 
 ---
 
